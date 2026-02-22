@@ -1,0 +1,4 @@
+
+# Xcode build logs
+.xcode_build.log
+.xcode_dryrun.log
