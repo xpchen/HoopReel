@@ -49,12 +49,7 @@ final class ShotDetector {
             throw DetectorError.noVideoTrack
         }
 
-        // Cap fps on simulator to avoid overwhelming the slow CoreML runtime
-        #if targetEnvironment(simulator)
-        let effectiveFps = min(fps, 3)
-        #else
         let effectiveFps = fps
-        #endif
 
         // ── Configure AVAssetReader (inline, no async buffer) ───────────
         let reader = try AVAssetReader(asset: asset)

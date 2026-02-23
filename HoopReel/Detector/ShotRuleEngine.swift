@@ -28,7 +28,9 @@ import CoreGraphics
 /// 2. **Displacement arrival (B)** — ball jumps by ≥ `arrivalDisplacement` between
 ///    consecutive frames while transitioning outside→inside.
 /// 3. **IoU arrival (C)** — ball bbox overlaps hoop bbox on the transition frame.
-/// 4. **Confirm** — A/B/C only set a *candidate*; make is emitted when confirmed by
+/// 4. **Descent arrival (D)** — ball was above hoop recently and descended into the
+///    zone, even if per-frame displacement is small.  Catches soft/arc shots.
+/// 5. **Confirm** — A/B/C/D only set a *candidate*; make is emitted when confirmed by
 ///    IoU ≥ confirmIouThreshold, rim proximity, or ball disappearance in zone.
 ///
 /// Ball selection: **score = confidence − 0.8 × distance(ballCenter, hoopCenter)**.
@@ -44,7 +46,9 @@ final class ShotRuleEngine {
 
     /// If the detected hoop center jumps more than this (normalised) in a single frame,
     /// treat it as a scene cut and reset the EMA immediately.
-    var hoopJumpResetThreshold: Double = 0.20
+    /// 0.30 avoids false resets from edge-of-frame artifacts (jump ≈ 0.20)
+    /// while still catching real scene cuts (jump > 0.50).
+    var hoopJumpResetThreshold: Double = 0.30
 
     /// IoU threshold: ball–hoop overlap to count as "ball at rim".
     var iouThreshold: Double = 0.08
@@ -62,13 +66,18 @@ final class ShotRuleEngine {
     var shotWindowSeconds: Double = 8.0
 
     /// Minimum displacement (normalised) to count as arrival without a detection gap.
-    var arrivalDisplacement: Double = 0.08
+    var arrivalDisplacement: Double = 0.05
 
     /// Consecutive frames without ball to confirm disappearance (candidate confirm).
-    var disappearFrames: Int = 2
+    var disappearFrames: Int = 3
 
     /// Minimum seconds between two makes to avoid double-counting.
-    var cooldownSeconds: Double = 2.5
+    var cooldownSeconds: Double = 6.0
+
+    /// Seconds after a hoop-reset (scene cut) during which no new candidates can form.
+    /// Prevents false positives when the camera cuts to a new scene and the ball
+    /// appears near a different hoop position.
+    var hoopResetCooldown: Double = 2.5
 
     /// If ball was inside zone within this many seconds, treat new inside detection
     /// as a continuation (not a fresh arrival).  Prevents brief-miss re-triggers.
@@ -82,6 +91,17 @@ final class ShotRuleEngine {
 
     /// Ball Y within this fraction of hoopH from rimY confirms a pending candidate.
     var confirmRimYRatio: Double = 1.5
+
+    /// Maximum displacement (normalised) for a 1-frame gap to be credible.
+    /// If gap ≤ 1 and displacement > this value, skip PatternA/B/C (likely a
+    /// detection switch between two different objects, not real ball movement).
+    /// PatternD (descent) is exempt — it has its own physics validation.
+    var maxShortGapDisplacement: Double = 0.20
+
+    /// Consecutive frames with ball detected **outside** the hoop zone after a
+    /// candidate is set.  If this count reaches `candidateOutsideMax`, the
+    /// candidate is invalidated (ball clearly left the area).
+    var candidateOutsideMax: Int = 3
 
     // MARK: - Debug State
 
@@ -121,9 +141,15 @@ final class ShotRuleEngine {
     private var candidateExpire:        Double  = -.infinity
     private var candidateSeenInZone:    Bool    = false
     private var candidateMissing:       Int     = 0
+    private var candidateOutside:       Int     = 0
 
-    private var lastMakeTime:    Double = -.infinity
-    private var makes:           [Event] = []
+    private var lastMakeTime:       Double = -.infinity
+    private var lastHoopResetTime:  Double = -.infinity
+    private var makes:              [Event] = []
+
+    // --- PatternD: ball descent history ---
+    /// Tracks recent (t, by, bx) for detecting a ball descending through the hoop.
+    private var ballYHistory: [(t: Double, by: CGFloat, bx: CGFloat)] = []
 
     // MARK: - Diagnostic Log
     private(set) var diagnosticLines: [String] = []
@@ -157,8 +183,11 @@ final class ShotRuleEngine {
         candidateExpire       = -.infinity
         candidateSeenInZone   = false
         candidateMissing      = 0
+        candidateOutside      = 0
         lastMakeTime          = -.infinity
+        lastHoopResetTime     = -.infinity
         makes                 = []
+        ballYHistory          = []
         debugState            = DebugState()
         diagnosticLines       = []
         // Truncate log file so each run starts fresh
@@ -180,7 +209,7 @@ final class ShotRuleEngine {
         if candidateTime != nil && timeSeconds > candidateExpire {
             log(String(format:
                 "DROP t=%.2f  reason=expired  cand=%@", timeSeconds, candidateReason))
-            candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0
+            candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0; candidateOutside = 0
         }
 
         // ── Hoop detection ────────────────────────────────────────────────────
@@ -196,6 +225,13 @@ final class ShotRuleEngine {
                 if jump > hoopJumpResetThreshold {
                     // Scene cut / fast pan — reset EMA to new position immediately
                     smoothedHoopRect = hr
+                    lastHoopResetTime = timeSeconds
+                    // Invalidate any pending candidate — it belongs to the old scene
+                    if candidateTime != nil {
+                        log(String(format:
+                            "t=%.2f  HOOP RESET invalidated cand=%@", timeSeconds, candidateReason))
+                        candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0; candidateOutside = 0
+                    }
                     log(String(format:
                         "t=%.2f  *** HOOP RESET (jump=%.3f)", timeSeconds, jump))
                 } else {
@@ -243,6 +279,7 @@ final class ShotRuleEngine {
 
         // ── Cooldown ─────────────────────────────────────────────────────────
         let cdRemaining = max(0, cooldownSeconds - (timeSeconds - lastMakeTime))
+        let resetCdRemaining = max(0, hoopResetCooldown - (timeSeconds - lastHoopResetTime))
         debugState.cooldownRemaining = cdRemaining
 
         // ── Hoop zone boundaries ──────────────────────────────────────────────
@@ -281,7 +318,12 @@ final class ShotRuleEngine {
             // Ball detected — reset disappearance counter
             candidateMissing = 0
 
+            // Track ball Y position for PatternD (descent detection)
+            ballYHistory.append((t: timeSeconds, by: by, bx: bx))
+            ballYHistory.removeAll { timeSeconds - $0.t > 2.0 }
+
             if inHoopZone {
+                candidateOutside = 0   // ball back in zone — reset outside counter
                 let recentlyInside = lastInsideTime.map { timeSeconds - $0 } ?? .infinity
 
                 // ── Candidate confirm (IoU or rim proximity) ──────────────────
@@ -295,7 +337,7 @@ final class ShotRuleEngine {
                         let r = String(format: "%@ ← CONF(iou=%.3f rim=%.3f)",
                             candidateReason, cIou, rimDist)
                         log("MAKE t=\(timeSeconds)  \(r)  via=iou/rim")
-                        candidateTime = nil; candidateSeenInZone = false
+                        candidateTime = nil; candidateSeenInZone = false; candidateOutside = 0
                         lastInsideTime = timeSeconds; missingAfterInside = 0
                         wasInsideLastFrame = true
                         return emitMake(at: timeSeconds, reason: r)
@@ -309,20 +351,51 @@ final class ShotRuleEngine {
                         let disp = hypot(bx - outsideP.x, by - outsideP.y)
                         let hadGap = gapFramesSinceOutside >= 1
 
-                        if dt <= shotWindowSeconds && cdRemaining <= 0 {
+                        if dt <= shotWindowSeconds && cdRemaining <= 0 && resetCdRemaining <= 0 {
                             var reason: String?
 
-                            // PatternA: gap ≥ 2 frames AND disp ≥ threshold
-                            if hadGap && disp >= arrivalDisplacement {
-                                reason = String(format:
-                                    "PatternA: gap=%d disp=%.3f dt=%.2f",
-                                    gapFramesSinceOutside, disp, dt)
-                            } else if disp >= arrivalDisplacement {
-                                reason = String(format:
-                                    "PatternB: disp=%.3f dt=%.2f", disp, dt)
-                            } else if iou > iouThreshold {
-                                reason = String(format:
-                                    "PatternC: IoU=%.3f dt=%.2f", iou, dt)
+                            // Short-gap displacement cap: if only 0-1 frames of gap
+                            // and the ball "jumped" more than maxShortGapDisplacement,
+                            // this is likely a detection switch (different object picked
+                            // as ball), not real ball movement.  Block A/B/C.
+                            let shortGapOk = gapFramesSinceOutside > 1
+                                          || disp <= maxShortGapDisplacement
+
+                            if shortGapOk {
+                                // PatternA: gap ≥ 2 frames AND disp ≥ threshold
+                                if hadGap && disp >= arrivalDisplacement {
+                                    reason = String(format:
+                                        "PatternA: gap=%d disp=%.3f dt=%.2f",
+                                        gapFramesSinceOutside, disp, dt)
+                                } else if disp >= arrivalDisplacement {
+                                    reason = String(format:
+                                        "PatternB: disp=%.3f dt=%.2f", disp, dt)
+                                } else if iou > iouThreshold {
+                                    reason = String(format:
+                                        "PatternC: IoU=%.3f dt=%.2f", iou, dt)
+                                }
+                            }
+
+                            // PatternD: ball descended from above hoop into zone.
+                            // Catches makes where the ball gradually drops through
+                            // the hoop with minimal per-frame displacement.
+                            if reason == nil && ballYHistory.count >= 3 {
+                                let hoopMinY = hoop.minY
+                                let aboveEntries = ballYHistory.filter {
+                                    $0.by < hoopMinY
+                                    && abs($0.bx - hoopMidX) <= hoopW * 1.5
+                                    && timeSeconds - $0.t <= 1.5
+                                }
+                                // Ball just needs to be near the hoop top area
+                                if let earliest = aboveEntries.first,
+                                   by >= hoopMinY - 0.2 * hoopH {
+                                    let yDrop = by - earliest.by
+                                    if yDrop > 0.03 {
+                                        reason = String(format:
+                                            "PatternD: descent=%.3f from_t=%.2f",
+                                            yDrop, earliest.t)
+                                    }
+                                }
                             }
 
                             let verdict = reason.map { "CANDIDATE(\($0))" }
@@ -335,6 +408,7 @@ final class ShotRuleEngine {
                                 candidateExpire     = timeSeconds + confirmWindowSeconds
                                 candidateSeenInZone = true
                                 candidateMissing    = 0
+                                candidateOutside    = 0
                                 log(String(format:
                                     "CAND t=%.2f  %@  expire=%.2f",
                                     timeSeconds, r, candidateExpire))
@@ -369,10 +443,25 @@ final class ShotRuleEngine {
                             "%@ ← CONF(below: y=%.3f hoopBot=%.3f)",
                             candidateReason, by, hoop.maxY)
                         log("MAKE t=\(timeSeconds)  \(r)  via=below-hoop")
-                        candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0
+                        candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0; candidateOutside = 0
                         lastInsideTime = timeSeconds; missingAfterInside = 0
                         wasInsideLastFrame = false
                         return emitMake(at: timeSeconds, reason: r)
+                    }
+                }
+
+                // ── Invalidate stale candidate if ball stays outside zone ──
+                // If the ball is consistently tracked outside the hoop zone,
+                // the candidate was likely spurious (e.g. marginal detection
+                // near the hoop set a candidate, but the ball then moved away).
+                if candidateTime != nil {
+                    candidateOutside += 1
+                    if candidateOutside >= candidateOutsideMax {
+                        log(String(format:
+                            "t=%.2f  CAND INVALIDATED (outside=%d) cand=%@",
+                            timeSeconds, candidateOutside, candidateReason))
+                        candidateTime = nil; candidateSeenInZone = false
+                        candidateMissing = 0; candidateOutside = 0
                     }
                 }
 
@@ -386,6 +475,7 @@ final class ShotRuleEngine {
             // Ball not detected
             gapFramesSinceOutside += 1
             wasInsideLastFrame     = false
+            ballYHistory.removeAll()
 
             diagnosticLines.append(String(format:
                 "t=%.2f  BALL=nil  hoopMid=(%.3f,%.3f)  zoneIN=N  gap=%d  inAge=%.2f  cd=%.1f",
@@ -399,7 +489,7 @@ final class ShotRuleEngine {
                     let r = String(format: "%@ ← CONF(disappear=%d)",
                         candidateReason, candidateMissing)
                     log("MAKE t=\(timeSeconds)  \(r)  via=disappear")
-                    candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0
+                    candidateTime = nil; candidateSeenInZone = false; candidateMissing = 0; candidateOutside = 0
                     return emitMake(at: timeSeconds, reason: r)
                 }
             }
