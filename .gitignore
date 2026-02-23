@@ -2,3 +2,12 @@
 # Xcode build logs
 .xcode_build.log
 .xcode_dryrun.log
+
+# Apple signing artifacts (never commit)
+*.certSigningRequest
+*.cer
+*.p12
+*.mobileprovision
+
+# Local test videos
+*.mp4
