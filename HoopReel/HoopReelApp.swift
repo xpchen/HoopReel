@@ -9,9 +9,13 @@ import SwiftUI
 
 @main
 struct HoopReelApp: App {
+
+    @StateObject private var langMgr = LanguageManager()
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(langMgr)
         }
     }
 }

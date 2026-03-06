@@ -33,10 +33,13 @@ enum EventEngine {
 
     // MARK: - Filter
 
-    /// Keeps only "make" events whose time falls within [0, videoDuration].
+    /// Known event types that contribute to clip generation.
+    static let clipEventTypes: Set<String> = ["make", "gain", "loss"]
+
+    /// Keeps only known event types whose time falls within [0, videoDuration].
     /// Returns the valid subset; caller can derive droppedCount by comparison.
     static func filterValid(events: [Event], videoDuration: Double) -> [Event] {
-        events.filter { $0.type == "make" && $0.time >= 0 && $0.time <= videoDuration }
+        events.filter { clipEventTypes.contains($0.type) && $0.time >= 0 && $0.time <= videoDuration }
     }
 
     // MARK: - Compute
@@ -48,14 +51,16 @@ enum EventEngine {
     ///   makes at 37.8 s → [33.8, 39.8]   ← overlaps; merged → [31.2, 39.8]
     ///
     /// - Parameters:
-    ///   - events:        raw event list (non-"make" types are ignored).
+    ///   - events:        raw event list.
     ///   - videoDuration: total video length in seconds (upper clamp bound).
-    ///   - pre:           seconds before each make (default 4.0).
-    ///   - post:          seconds after each make (default 2.0).
+    ///   - eventTypes:    event types to include (default: all clip types).
+    ///   - pre:           seconds before each event (default 4.0).
+    ///   - post:          seconds after each event (default 2.0).
     ///   - mergeGap:      merge consecutive ranges within this gap (default 2.0).
     static func computeClipRanges(
         from events:       [Event],
         videoDuration:     Double,
+        eventTypes: Set<String> = clipEventTypes,
         pre:      Double = defaultPre,
         post:     Double = defaultPost,
         mergeGap: Double = defaultMergeGap
@@ -64,7 +69,7 @@ enum EventEngine {
         // Clamp event times to [0, videoDuration] so out-of-range events still
         // contribute a clip at the boundary rather than being silently dropped.
         let times = events
-            .filter { $0.type == "make" }
+            .filter { eventTypes.contains($0.type) }
             .map    { max(0, min(videoDuration, $0.time)) }
             .sorted ()
 
@@ -94,16 +99,17 @@ enum EventEngine {
         return merged.filter { $0.duration > 0 }
     }
 
-    /// One ClipRange per make event, **no merging**.
-    /// Used for "多段" export so each shot gets its own file.
+    /// One ClipRange per event, **no merging**.
+    /// Used for "多段" export so each event gets its own file.
     static func computeRawClipRanges(
         from events:   [Event],
         videoDuration: Double,
+        eventTypes: Set<String> = clipEventTypes,
         pre:  Double = defaultPre,
         post: Double = defaultPost
     ) -> [ClipRange] {
         events
-            .filter { $0.type == "make" }
+            .filter { eventTypes.contains($0.type) }
             .map    { max(0, min(videoDuration, $0.time)) }
             .sorted()
             .map {

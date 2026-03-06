@@ -20,6 +20,12 @@ struct DetectionOverlayView: View {
     /// draws lockedHoopRect, rimY line, and a status badge.
     var debugState: ShotRuleEngine.DebugState? = nil
 
+    /// Optional tracked player box (top-left normalized).
+    var trackedPlayerBox: CGRect? = nil
+
+    /// Possession debug state for player tracking overlay.
+    var possessionDebug: PossessionRuleEngine.DebugState? = nil
+
     var body: some View {
         Canvas { context, _ in
             let displayRect = aspectFitRect(
@@ -113,6 +119,66 @@ struct DetectionOverlayView: View {
                 at: CGPoint(x: badgeRect.minX + 4, y: badgeRect.minY + 2),
                 anchor: .topLeading
             )
+
+            // ── 3. Tracked player box (top-left coords) ──────────────────
+            if let playerBox = trackedPlayerBox {
+                let pScreen = mapTopLeftToScreen(playerBox, in: displayRect)
+                let pColor: Color = possessionDebug?.possessionState == "targetHasBall"
+                    ? .green : .cyan
+
+                context.stroke(
+                    Path(pScreen),
+                    with: .color(pColor),
+                    style: StrokeStyle(lineWidth: 2.5, dash: [8, 4])
+                )
+
+                // Possession badge above player box
+                if let pDebug = possessionDebug {
+                    let label = pDebug.possessionState == "targetHasBall" ? "BALL" : "—"
+                    let pResolved = context.resolve(
+                        Text(label)
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                    )
+                    let pTextSize = pResolved.measure(in: viewSize)
+                    let pBadge = CGRect(
+                        x:      pScreen.midX - pTextSize.width / 2 - 4,
+                        y:      max(0, pScreen.minY - pTextSize.height - 6),
+                        width:  pTextSize.width + 8,
+                        height: pTextSize.height + 4
+                    )
+                    context.fill(Path(pBadge), with: .color(pColor.opacity(0.85)))
+                    context.draw(
+                        pResolved,
+                        at: CGPoint(x: pBadge.minX + 4, y: pBadge.minY + 2),
+                        anchor: .topLeading
+                    )
+                }
+            }
+
+            // ── 4. Possession stats badge (bottom-left) ──────────────────
+            if let pDebug = possessionDebug,
+               (pDebug.gainsTotal > 0 || pDebug.lossesTotal > 0) {
+                let statsText = "G:\(pDebug.gainsTotal) L:\(pDebug.lossesTotal)"
+                let sResolved = context.resolve(
+                    Text(statsText)
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white)
+                )
+                let sSize = sResolved.measure(in: viewSize)
+                let sBadge = CGRect(
+                    x:      displayRect.minX + 4,
+                    y:      displayRect.maxY - sSize.height - 8,
+                    width:  sSize.width + 8,
+                    height: sSize.height + 4
+                )
+                context.fill(Path(sBadge), with: .color(.black.opacity(0.7)))
+                context.draw(
+                    sResolved,
+                    at: CGPoint(x: sBadge.minX + 4, y: sBadge.minY + 2),
+                    anchor: .topLeading
+                )
+            }
         }
     }
 

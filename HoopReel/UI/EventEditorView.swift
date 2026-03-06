@@ -14,6 +14,11 @@ struct EventEditorView: View {
     var videoURL: URL?                      // used to create localPlayer on appear
     var onChanged: () async -> Void
 
+    // MARK: Language
+
+    @EnvironmentObject private var langMgr: LanguageManager
+    private func t(_ key: String) -> String { langMgr.tr(key) }
+
     // MARK: Local state
 
     @State private var localPlayer: AVPlayer? = nil
@@ -44,11 +49,11 @@ struct EventEditorView: View {
                 eventSection
             }
             .listStyle(.insetGrouped)
-            .navigationTitle("事件编辑")
+            .navigationTitle(t("event_editor_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { stopPreview(); dismiss() }
+                    Button(t("close")) { stopPreview(); dismiss() }
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Button { addTimeText = ""; showAddSheet = true } label: {
@@ -58,10 +63,10 @@ struct EventEditorView: View {
             }
         }
         .sheet(isPresented: $showAddSheet) { addMakeSheet }
-        .alert("提示", isPresented: $showAlert) {
-            Button("确定", role: .cancel) {}
+        .alert(t("alert_title"), isPresented: $showAlert) {
+            Button(t("alert_ok"), role: .cancel) {}
         } message: {
-            Text(alertMsg)
+            Text(verbatim: alertMsg)
         }
         .onAppear {
             if let url = videoURL {
@@ -80,23 +85,23 @@ struct EventEditorView: View {
     private var statsSection: some View {
         Section {
             HStack(spacing: 0) {
-                statCell("\(events.count)", "事件")
+                statCell("\(events.count)", t("events_label"))
                 Divider().frame(height: 32)
-                statCell("\(clipRanges.count)", "片段")
+                statCell("\(clipRanges.count)", t("clips_label"))
                 Divider().frame(height: 32)
                 let total = clipRanges.reduce(0) { $0 + $1.duration }
-                statCell(String(format: "%.1f s", total), "总时长")
+                statCell(String(format: "%.1f s", total), t("total_duration_label"))
             }
 
             if isPreviewing {
                 Button(role: .destructive, action: stopPreview) {
-                    Label("停止预览", systemImage: "stop.circle.fill")
+                    Label(t("stop_preview"), systemImage: "stop.circle.fill")
                         .frame(maxWidth: .infinity, alignment: .center)
                 }
                 .tint(.red)
             } else {
                 Button(action: startPreviewAll) {
-                    Label("Preview All", systemImage: "play.rectangle.fill")
+                    Label(t("preview_all"), systemImage: "play.rectangle.fill")
                         .frame(maxWidth: .infinity, alignment: .center)
                 }
                 .disabled(events.isEmpty || localPlayer == nil)
@@ -106,22 +111,38 @@ struct EventEditorView: View {
 
     private func statCell(_ value: String, _ label: String) -> some View {
         VStack(spacing: 2) {
-            Text(value).font(.title3.bold()).monospacedDigit()
-            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(verbatim: value).font(.title3.bold()).monospacedDigit()
+            Text(verbatim: label).font(.caption2).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
     }
 
     private var eventSection: some View {
-        Section("进球事件 (\(sortedEvents.count))") {
+        Section(String(format: t("make_events_section"), sortedEvents.count)) {
             ForEach(sortedEvents) { event in
                 eventRow(event)
                     .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                         Button(role: .destructive) { deleteEvent(event) } label: {
-                            Label("删除", systemImage: "trash")
+                            Label(t("delete"), systemImage: "trash")
                         }
                     }
             }
+        }
+    }
+
+    private func eventBadgeColor(_ event: Event) -> Color {
+        switch event.type {
+        case "gain": return .green
+        case "loss": return .red
+        default:     return .orange
+        }
+    }
+
+    private func eventTypeLabel(_ event: Event) -> String {
+        switch event.type {
+        case "gain": return t("possession_gain")
+        case "loss": return t("possession_loss")
+        default:     return "Make"
         }
     }
 
@@ -130,12 +151,23 @@ struct EventEditorView: View {
         return HStack(spacing: 10) {
             Text("\(idx)")
                 .font(.caption.bold()).foregroundStyle(.white)
-                .frame(width: 22, height: 22).background(.orange).clipShape(Circle())
+                .frame(width: 22, height: 22).background(eventBadgeColor(event)).clipShape(Circle())
 
             Button { previewEvent(event) } label: {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(formatTime(event.time)).font(.body.monospacedDigit()).foregroundStyle(.primary)
-                    Text("点击预览 1.5 s").font(.caption2).foregroundStyle(.orange)
+                    HStack(spacing: 4) {
+                        Text(verbatim: formatTime(event.time)).font(.body.monospacedDigit()).foregroundStyle(.primary)
+                        if event.type != "make" {
+                            Text(eventTypeLabel(event))
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(eventBadgeColor(event).opacity(0.2))
+                                .foregroundStyle(eventBadgeColor(event))
+                                .cornerRadius(3)
+                        }
+                    }
+                    Text(verbatim: t("tap_to_preview_3s")).font(.caption2).foregroundStyle(.orange)
                 }
             }
             .buttonStyle(.plain)
@@ -163,19 +195,19 @@ struct EventEditorView: View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("如：34.5 或 1:14.50", text: $addTimeText)
+                    TextField(t("add_time_placeholder"), text: $addTimeText)
                         .keyboardType(.decimalPad)
-                } header: { Text("输入时间点（秒）") }
-                  footer: { Text("支持格式：34.5 / 1:14 / 1:14.50") }
+                } header: { Text(verbatim: t("input_time_header")) }
+                  footer: { Text(verbatim: t("input_time_footer")) }
             }
-            .navigationTitle("添加进球")
+            .navigationTitle(t("add_make_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") { showAddSheet = false }
+                    Button(t("cancel")) { showAddSheet = false }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("添加") { commitAdd() }
+                    Button(t("add")) { commitAdd() }
                         .disabled(addTimeText.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
@@ -196,7 +228,7 @@ struct EventEditorView: View {
         guard let idx = events.firstIndex(where: { $0.id == event.id }) else { return }
         let newTime = max(0, round((event.time + delta) * 10) / 10)
         if let c = events.first(where: { $0.id != event.id && abs($0.time - newTime) < 0.3 }) {
-            alertMsg = "与 \(formatTime(c.time)) 相差不足 0.3 s，请重新调整。"
+            alertMsg = String(format: t("conflict_too_close"), formatTime(c.time))
             showAlert = true; return
         }
         events[idx] = Event(id: event.id, time: newTime, type: event.type)
@@ -206,12 +238,12 @@ struct EventEditorView: View {
     private func commitAdd() {
         guard let secs = parseTime(addTimeText), secs >= 0 else {
             showAddSheet = false
-            alertMsg = "时间格式无效，请输入如 34.5 或 1:14.50"
+            alertMsg = t("invalid_time_format")
             showAlert = true; return
         }
         if let c = events.first(where: { abs($0.time - secs) < 0.3 }) {
             showAddSheet = false
-            alertMsg = "与 \(formatTime(c.time)) 相差不足 0.3 s，添加已取消。"
+            alertMsg = String(format: t("conflict_cancelled"), formatTime(c.time))
             showAlert = true; return
         }
         withAnimation { events.append(Event(time: secs, type: "make")) }
@@ -293,4 +325,5 @@ struct EventEditorView: View {
     ]
     @Previewable @State var clips: [ClipRange] = [ClipRange(start: 8.3, end: 18.3)]
     EventEditorView(events: $events, clipRanges: $clips, videoURL: nil) {}
+        .environmentObject(LanguageManager())
 }

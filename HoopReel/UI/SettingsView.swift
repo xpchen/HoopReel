@@ -7,6 +7,9 @@ import SwiftUI
 /// ContentView can read the same keys and react to changes automatically.
 struct SettingsView: View {
 
+    @EnvironmentObject private var langMgr: LanguageManager
+    private func t(_ key: String) -> String { langMgr.tr(key) }
+
     @AppStorage("preSeconds")      var preSeconds:      Double = 4.0
     @AppStorage("postSeconds")     var postSeconds:     Double = 2.0
     @AppStorage("mergeGapSeconds") var mergeGapSeconds: Double = 2.0
@@ -16,30 +19,44 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // ── Clip timing ────────────────────────────────────────────────
                 Section {
                     DoubleStepper(
-                        label: "进攻前缓冲",
+                        label: t("pre_buffer"),
                         value: $preSeconds,
                         step: 0.5, min: 0.5, max: 15
                     )
                     DoubleStepper(
-                        label: "进攻后缓冲",
+                        label: t("post_buffer"),
                         value: $postSeconds,
                         step: 0.5, min: 0.5, max: 15
                     )
                     DoubleStepper(
-                        label: "合并间隔",
+                        label: t("merge_gap"),
                         value: $mergeGapSeconds,
                         step: 0.5, min: 0.0, max: 15
                     )
                 } header: {
-                    Text("片段时间参数（秒）")
+                    Text(verbatim: t("clip_timing_section"))
                 } footer: {
-                    Text("调整后片段范围实时生效。合并间隔越大，相邻投篮越可能合并为一个片段。")
+                    Text(verbatim: t("clip_timing_footer"))
                 }
 
+                // ── Language ───────────────────────────────────────────────────
                 Section {
-                    Button("恢复默认值") {
+                    Picker(t("language_section"), selection: $langMgr.storedLanguage) {
+                        ForEach(AppLanguage.allCases) { lang in
+                            Text(verbatim: lang.displayName).tag(lang.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                } header: {
+                    Text(verbatim: t("language_section"))
+                }
+
+                // ── Reset ──────────────────────────────────────────────────────
+                Section {
+                    Button(t("reset_defaults")) {
                         preSeconds      = EventEngine.defaultPre
                         postSeconds     = EventEngine.defaultPost
                         mergeGapSeconds = EventEngine.defaultMergeGap
@@ -47,11 +64,11 @@ struct SettingsView: View {
                     .foregroundStyle(.orange)
                 }
             }
-            .navigationTitle("设置")
+            .navigationTitle(t("settings_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }
+                    Button(t("done")) { dismiss() }
                 }
             }
         }
@@ -70,7 +87,7 @@ private struct DoubleStepper: View {
 
     var body: some View {
         HStack {
-            Text(label)
+            Text(verbatim: label)
             Spacer()
             Text(String(format: "%.1f s", value))
                 .monospacedDigit()
@@ -86,4 +103,5 @@ private struct DoubleStepper: View {
 
 #Preview {
     SettingsView()
+        .environmentObject(LanguageManager())
 }

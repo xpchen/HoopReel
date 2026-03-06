@@ -78,12 +78,24 @@ struct ContentView: View {
     @State private var showClipsResult    = false       // multi-clip result sheet
     @State private var droppedEventCount  = 0           // events beyond video duration
 
-    // MARK: State – Hoop ROI (Step 6)
+    // MARK: State – Player Tracking
 
-    @State private var isSelectingHoop:   Bool    = false  // drag overlay active
-    @State private var userSelectionRect: CGRect? = nil    // raw drawn rect (Vision coords)
-    @State private var lockedRoiRect:     CGRect? = nil    // expanded+clamped final ROI
-    @State private var isLockingROI:      Bool    = false  // spinner while finding hoop
+    enum DetectionMode: String, CaseIterable {
+        case shotDetection  = "shot"
+        case playerTracking = "player"
+    }
+
+    @State private var detectionMode:            DetectionMode = .shotDetection
+    @State private var showPlayerSelectionSheet = false
+    @State private var selectedPlayerPoint:      CGPoint?      = nil
+    @State private var trackedPlayerBox:         CGRect?       = nil
+    @State private var trackedPlayerInitial:     TrackedPlayer? = nil
+    @State private var possessionDebug          = PossessionRuleEngine.DebugState()
+
+    // MARK: Language
+
+    @EnvironmentObject private var langMgr: LanguageManager
+    private func t(_ key: String) -> String { langMgr.tr(key) }
 
     // MARK: Body
 
@@ -156,10 +168,6 @@ struct ContentView: View {
             postSeconds     = preset.post
             mergeGapSeconds = preset.mergeGap
         }
-        // When user finishes drawing, lock the ROI by running a quick inference
-        .onChange(of: userSelectionRect) { _, rect in
-            if let rect { Task { await lockHoopROI(userROI: rect) } }
-        }
         // ── Sheets / alerts ───────────────────────────────────────────────────
         .sheet(isPresented: $showShare) {
             if let url = exporter.exportedURL {
@@ -168,6 +176,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView()
+                .environmentObject(langMgr)
         }
         .sheet(isPresented: $showEventEditor) {
             EventEditorView(
@@ -176,14 +185,30 @@ struct ContentView: View {
                 videoURL:   videoURL,
                 onChanged:  { await recomputeClips() }
             )
+            .environmentObject(langMgr)
         }
         .sheet(isPresented: $showClipsResult) {
             clipsResultSheet
         }
-        .alert("提示", isPresented: $showAlert) {
-            Button("确定", role: .cancel) {}
+        .sheet(isPresented: $showPlayerSelectionSheet) {
+            if let url = videoURL {
+                PlayerSelectionSheet(
+                    videoURL: url,
+                    atSeconds: player?.currentTime().seconds ?? 0
+                ) { confirmed, point in
+                    if let confirmed {
+                        trackedPlayerInitial = confirmed
+                        trackedPlayerBox     = confirmed.boundingBox
+                        selectedPlayerPoint  = point
+                    }
+                }
+                .environmentObject(langMgr)
+            }
+        }
+        .alert(t("alert_title"), isPresented: $showAlert) {
+            Button(t("alert_ok"), role: .cancel) {}
         } message: {
-            Text(alertMessage)
+            Text(verbatim: alertMessage)
         }
     }
 
@@ -196,7 +221,7 @@ struct ContentView: View {
             Image(systemName: "basketball.fill")
                 .font(.system(size: 56))
                 .foregroundStyle(.orange)
-            Text("自动生成投篮精彩集锦")
+            Text(t("subtitle"))
                 .font(.headline)
                 .foregroundStyle(.secondary)
         }
@@ -213,9 +238,9 @@ struct ContentView: View {
                           ? "video.badge.plus"
                           : "checkmark.circle.fill")
                 }
-                Text(isLoadingVideo    ? "加载中…"
-                     : videoURL == nil ? "选择比赛视频"
-                                       : "重新选择视频")
+                Text(isLoadingVideo    ? t("loading")
+                     : videoURL == nil ? t("select_video")
+                                       : t("reselect_video"))
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -238,52 +263,10 @@ struct ContentView: View {
             } else if let player {
                 normalPlayerView(player: player)
             }
-
-            // ── Hoop selector overlay (yellow, drag-to-draw) ────────────────
-            HoopRoiSelectorView(
-                selectionNormalized: $userSelectionRect,
-                isActive: isSelectingHoop
-            )
-
-            // ── Locked ROI border (indigo, always shown when set) ───────────
-            if let roi = lockedRoiRect {
-                roiDebugOverlay(roi)
-            }
-
-            // ── ROI lock spinner ────────────────────────────────────────────
-            if isLockingROI {
-                ProgressView()
-                    .tint(.indigo)
-                    .scaleEffect(1.4)
-                    .padding(10)
-                    .background(.ultraThinMaterial)
-                    .clipShape(Circle())
-            }
         }
         .frame(height: 210)
         .cornerRadius(12)
         .clipped()
-    }
-
-    /// Semi-transparent indigo border for the active ROI (debug aid).
-    private func roiDebugOverlay(_ roi: CGRect) -> some View {
-        GeometryReader { geo in
-            let r = CGRect(
-                x:      roi.minX            * geo.size.width,
-                y:      (1 - roi.maxY)      * geo.size.height,
-                width:  roi.width           * geo.size.width,
-                height: roi.height          * geo.size.height
-            )
-            ZStack {
-                Rectangle().fill(Color.indigo.opacity(0.07))
-                Rectangle()
-                    .strokeBorder(Color.indigo,
-                                  style: StrokeStyle(lineWidth: 1.5, dash: [8, 3]))
-            }
-            .frame(width: max(1, r.width), height: max(1, r.height))
-            .position(x: r.midX, y: r.midY)
-        }
-        .allowsHitTesting(false)
     }
 
     private func detectionFramePreview(image: UIImage) -> some View {
@@ -297,9 +280,20 @@ struct ContentView: View {
                             detections: currentDetections,
                             imageSize:  image.size,
                             viewSize:   geo.size,
-                            debugState: isFullDetection ? ruleEngineDebug : nil
+                            debugState: isFullDetection ? ruleEngineDebug : nil,
+                            trackedPlayerBox: trackedPlayerBox,
+                            possessionDebug: detectionMode == .playerTracking ? possessionDebug : nil
                         )
                     }
+                }
+            }
+            .overlay {
+                if detectionMode == .playerTracking && trackedPlayerBox != nil {
+                    PlayerSelectorView(
+                        trackedPlayerBox: trackedPlayerBox,
+                        possessionState:  possessionDebug.possessionState
+                    )
+                    .environmentObject(langMgr)
                 }
             }
             .overlay(alignment: .topLeading) {
@@ -332,7 +326,7 @@ struct ContentView: View {
     private func normalPlayerView(player: AVPlayer) -> some View {
         VideoPlayer(player: player)
             .overlay(alignment: .topTrailing) {
-                Text("预览")
+                Text(t("preview_label"))
                     .font(.caption2.bold())
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
@@ -346,59 +340,26 @@ struct ContentView: View {
 
     private var detectionControlsSection: some View {
         VStack(spacing: 10) {
+            // ── Detection mode picker ─────────────────────────────────
+            Picker("Mode", selection: $detectionMode) {
+                Text(t("mode_shot_detect")).tag(DetectionMode.shotDetection)
+                Text(t("mode_player_track")).tag(DetectionMode.playerTracking)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: detectionMode) { _, _ in
+                // Reset player tracking state when switching modes
+                selectedPlayerPoint  = nil
+                trackedPlayerBox     = nil
+                trackedPlayerInitial = nil
+                possessionDebug      = PossessionRuleEngine.DebugState()
+            }
+
             // Toggle row
             Toggle(isOn: $showDebugOverlay) {
-                Label("Debug Overlay", systemImage: "rectangle.dashed")
+                Label(t("debug_overlay"), systemImage: "rectangle.dashed")
                     .font(.callout)
             }
             .tint(.orange)
-
-            // ── Hoop ROI row ─────────────────────────────────────────────────
-            HStack(spacing: 10) {
-                Button {
-                    if isSelectingHoop {
-                        isSelectingHoop   = false
-                        userSelectionRect = nil
-                    } else {
-                        isSelectingHoop = true
-                    }
-                } label: {
-                    Label(isSelectingHoop ? "取消框选" : "Select Hoop",
-                          systemImage: isSelectingHoop ? "xmark.circle" : "scope")
-                        .font(.callout.bold())
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(isSelectingHoop ? .gray : .indigo)
-                .disabled(videoURL == nil || isRunningDetection)
-
-                if lockedRoiRect != nil {
-                    Button { resetHoopROI() } label: {
-                        Label("Reset ROI", systemImage: "arrow.counterclockwise")
-                            .font(.callout.bold())
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.gray)
-                    .disabled(isRunningDetection)
-                }
-            }
-
-            // ROI status hint
-            if isSelectingHoop {
-                Text("在视频画面上拖拽框选篮筐区域")
-                    .font(.caption).foregroundStyle(.indigo)
-            } else if isLockingROI {
-                Label("正在锁定篮筐…", systemImage: "scope")
-                    .font(.caption).foregroundStyle(.indigo)
-            } else if let roi = lockedRoiRect {
-                Label(String(format: "ROI  %.2f,%.2f  %.2f×%.2f",
-                             roi.minX, roi.minY, roi.width, roi.height),
-                      systemImage: "scope")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.indigo)
-            }
 
             // Buttons row
             if isRunningDetection {
@@ -406,20 +367,20 @@ struct ContentView: View {
                 Button(role: .destructive) {
                     stopDetection()
                 } label: {
-                    Label("停止检测", systemImage: "stop.circle.fill")
+                    Label(t("stop_detection"), systemImage: "stop.circle.fill")
                         .font(.callout.bold())
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)
-            } else {
-                // Quick test buttons (10 s from current player position)
+            } else if detectionMode == .shotDetection {
+                // ── Shot detection buttons ─────────────────────────────
                 HStack(spacing: 10) {
                     Button {
                         runDetectionPreview()
                     } label: {
-                        Label("Preview (10s)", systemImage: "viewfinder.rectangular")
+                        Label(t("preview_10s"), systemImage: "viewfinder.rectangular")
                             .font(.callout.bold())
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -431,7 +392,7 @@ struct ContentView: View {
                     Button {
                         runQuickDetection()
                     } label: {
-                        Label("Detect (10s)", systemImage: "sparkle.magnifyingglass")
+                        Label(t("detect_10s"), systemImage: "sparkle.magnifyingglass")
                             .font(.callout.bold())
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 10)
@@ -441,11 +402,10 @@ struct ContentView: View {
                     .disabled(videoURL == nil || exporter.isExporting)
                 }
 
-                // Full detection button
                 Button {
                     runFullDetection()
                 } label: {
-                    Label("Auto Detect (Full)", systemImage: "sparkle.magnifyingglass")
+                    Label(t("auto_detect_full"), systemImage: "sparkle.magnifyingglass")
                         .font(.callout.bold())
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
@@ -453,6 +413,9 @@ struct ContentView: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
                 .disabled(videoURL == nil || exporter.isExporting)
+            } else {
+                // ── Player tracking buttons ────────────────────────────
+                playerTrackingControls
             }
 
             // Stats after detection finishes
@@ -467,23 +430,81 @@ struct ContentView: View {
         .cornerRadius(12)
     }
 
+    /// Player tracking mode buttons: select player → start tracking.
+    private var playerTrackingControls: some View {
+        VStack(spacing: 10) {
+            // Step 1: Select player
+            HStack(spacing: 10) {
+                Button {
+                    enterPlayerSelectionMode()
+                } label: {
+                    Label(
+                        trackedPlayerInitial == nil ? t("select_player") : t("reselect_player"),
+                        systemImage: "person.crop.rectangle"
+                    )
+                    .font(.callout.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.cyan)
+                .disabled(videoURL == nil || exporter.isExporting)
+            }
+
+            // Player selected indicator
+            if trackedPlayerInitial != nil {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(t("player_selected"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            // Step 2: Start tracking
+            Button {
+                runPlayerTracking()
+            } label: {
+                Label(t("start_tracking"), systemImage: "figure.run")
+                    .font(.callout.bold())
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .disabled(videoURL == nil || trackedPlayerInitial == nil || exporter.isExporting)
+        }
+    }
+
     private var detectionProgressSection: some View {
         VStack(spacing: 6) {
             ProgressView(value: detectionProgress)
-                .tint(isFullDetection ? .green : .purple)
+                .tint(detectionMode == .playerTracking ? .cyan : (isFullDetection ? .green : .purple))
                 .animation(.linear(duration: 0.08), value: detectionProgress)
-            Text(String(format: "%@ %.1f / %.0f 秒",
-                        isFullDetection ? "检测进球中" : "检测中",
+            Text(String(format: "%@ %.1f / %.0f s",
+                        detectionMode == .playerTracking
+                            ? t("detecting_possession")
+                            : (isFullDetection ? t("detecting_makes") : t("detecting")),
                         detectionProgress * detectionMaxSeconds,
                         detectionMaxSeconds))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             // During full detection show live makes count
-            if isFullDetection && ruleEngineDebug.makesCount > 0 {
-                Text("已检测到 \(ruleEngineDebug.makesCount) 个进球")
+            if detectionMode == .shotDetection && isFullDetection && ruleEngineDebug.makesCount > 0 {
+                Text(String(format: t("detected_makes_count"), ruleEngineDebug.makesCount))
                     .font(.caption.bold())
                     .foregroundStyle(.green)
+            }
+
+            // During player tracking show live gain/loss count
+            if detectionMode == .playerTracking
+                && (possessionDebug.gainsTotal > 0 || possessionDebug.lossesTotal > 0) {
+                Text(String(format: t("tracking_live_count"),
+                            possessionDebug.gainsTotal, possessionDebug.lossesTotal))
+                    .font(.caption.bold())
+                    .foregroundStyle(.cyan)
             }
         }
     }
@@ -501,25 +522,33 @@ struct ContentView: View {
             }
 
             // Three-state event status
-            let makeCount = events.filter { $0.type == "make" }.count
+            let makeCount  = events.filter { $0.type == "make" }.count
+            let gainCount  = events.filter { $0.type == "gain" }.count
+            let lossCount  = events.filter { $0.type == "loss" }.count
+            let totalCount = makeCount + gainCount + lossCount
             Label {
                 if videoURL == nil {
-                    Text("请选择视频")
+                    Text(t("please_select_video"))
                         .foregroundStyle(.secondary)
-                } else if makeCount == 0 {
-                    Text("尚未生成事件：点击 Auto Detect 或导入 events.json")
+                } else if totalCount == 0 {
+                    Text(t("no_events_hint"))
                         .foregroundStyle(.secondary)
                 } else if droppedEventCount > 0 {
-                    Text("\(makeCount) 个进球事件 · 忽略超时：\(droppedEventCount)")
+                    Text(String(format: t("events_with_dropped"), makeCount, droppedEventCount))
                         .foregroundStyle(.orange)
                 } else {
-                    Text("\(makeCount) 个进球事件")
+                    let parts = [
+                        makeCount > 0 ? String(format: t("events_count"), makeCount) : nil,
+                        gainCount > 0 ? String(format: t("gains_count"), gainCount) : nil,
+                        lossCount > 0 ? String(format: t("losses_count"), lossCount) : nil,
+                    ].compactMap { $0 }
+                    Text(parts.joined(separator: " · "))
                 }
             } icon: {
                 Image(systemName: "target")
                     .foregroundStyle(
                         videoURL == nil      ? Color.secondary
-                        : makeCount == 0     ? Color.secondary
+                        : totalCount == 0    ? Color.secondary
                         : droppedEventCount > 0 ? Color.orange : Color.green
                     )
             }
@@ -528,7 +557,7 @@ struct ContentView: View {
                 let total = String(format: "%.1f",
                                    clipRanges.reduce(0) { $0 + $1.duration })
                 Label {
-                    Text("\(clipRanges.count) 个片段 · 合计约 \(total) 秒")
+                    Text(String(format: t("clips_summary"), clipRanges.count, total))
                 } icon: {
                     Image(systemName: "scissors").foregroundStyle(.blue)
                 }
@@ -549,10 +578,10 @@ struct ContentView: View {
                     .foregroundStyle(.orange)
                     .frame(width: 32)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("事件列表")
+                    Text(t("event_list_title"))
                         .font(.callout.bold())
                         .foregroundStyle(.primary)
-                    Text("\(events.count) 个进球 · 点击编辑 / 预览")
+                    Text("\(events.count) \(t("events_label"))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -570,7 +599,7 @@ struct ContentView: View {
 
     private var rangeListSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionHeader(title: "合并片段", count: clipRanges.count)
+            SectionHeader(title: t("merged_clips"), count: clipRanges.count)
 
             ForEach(Array(clipRanges.enumerated()), id: \.element.id) { idx, range in
                 RangeRow(range: range, index: idx + 1) {
@@ -585,14 +614,14 @@ struct ContentView: View {
             ProgressView(value: exporter.progress)
                 .tint(.orange)
                 .animation(.linear(duration: 0.1), value: exporter.progress)
-            Text(String(format: "正在导出 %.0f%%", exporter.progress * 100))
+            Text(String(format: t("exporting_progress"), exporter.progress * 100))
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
             Button(role: .destructive) {
                 exporter.cancelExport()
             } label: {
-                Label("取消导出", systemImage: "xmark.circle")
+                Label(t("cancel_export"), systemImage: "xmark.circle")
                     .font(.caption)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 6)
@@ -607,7 +636,7 @@ struct ContentView: View {
     private func retrySection(message: String) -> some View {
         VStack(spacing: 10) {
             Label {
-                Text("导出失败：\(message)")
+                Text(String(format: t("export_failed"), message))
                     .font(.callout)
                     .multilineTextAlignment(.center)
             } icon: {
@@ -615,7 +644,7 @@ struct ContentView: View {
                     .foregroundStyle(.red)
             }
 
-            Button("重新导出") { startExport() }
+            Button(t("retry_export")) { startExport() }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
         }
@@ -650,16 +679,16 @@ struct ContentView: View {
                     .foregroundStyle(.blue)
                 }
             }
-            .navigationTitle("导出片段（\(exporter.exportedURLs.count) 个）")
+            .navigationTitle(String(format: t("exported_clips_title"), exporter.exportedURLs.count))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") { showClipsResult = false }
+                    Button(t("close")) { showClipsResult = false }
                 }
                 ToolbarItem(placement: .primaryAction) {
                     // "全部分享" — user can pick "存储到文件" from the share sheet
                     ShareLink(items: exporter.exportedURLs) {
-                        Text("全部分享")
+                        Text(t("share_all"))
                     }
                 }
             }
@@ -669,28 +698,28 @@ struct ContentView: View {
     private var presetSection: some View {
         VStack(spacing: 10) {
             // ── Export mode ──────────────────────────────────────────────────
-            Picker("导出模式", selection: $exportMode) {
+            Picker(t("export_mode"), selection: $exportMode) {
                 ForEach(ExportMode.allCases) { mode in
-                    Text(mode.displayName).tag(mode)
+                    Text(mode.localizedName(using: langMgr)).tag(mode)
                 }
             }
             .pickerStyle(.segmented)
 
             // ── Clip-timing preset ───────────────────────────────────────────
-            Picker("导出预设", selection: $selectedPreset) {
+            Picker(t("export_preset"), selection: $selectedPreset) {
                 ForEach(ExportPreset.allCases) { preset in
-                    Text(preset.displayName).tag(preset)
+                    Text(preset.localizedName(using: langMgr)).tag(preset)
                 }
             }
             .pickerStyle(.segmented)
 
             // Parameter summary
             HStack {
-                Text(selectedPreset.subtitle)
+                Text(selectedPreset.localizedSubtitle(using: langMgr))
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                 Spacer()
-                Text(selectedPreset.paramSummary)
+                Text(selectedPreset.localizedParamSummary(using: langMgr))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -705,9 +734,9 @@ struct ContentView: View {
         return Button(action: startExport) {
             HStack(spacing: 8) {
                 Image(systemName: "square.and.arrow.up.fill")
-                Text(exporter.isExporting ? "导出中…"
-                     : exportMode == .highlight ? "生成精彩集锦"
-                     : "导出 \(rawRanges.count) 段视频")
+                Text(exporter.isExporting ? t("exporting")
+                     : exportMode == .highlight ? t("generate_highlight")
+                     : String(format: t("export_clips_n"), rawRanges.count))
                     .fontWeight(.semibold)
             }
             .frame(maxWidth: .infinity)
@@ -742,9 +771,15 @@ struct ContentView: View {
         stopDetection()
         currentFrameImage = nil
         currentDetections = []
-        detectionStats    = "已切换视频，请重新 Auto Detect"
+        detectionStats    = t("switched_video_hint")
         ruleEngineDebug   = ShotRuleEngine.DebugState()
-        resetHoopROI()
+        // Reset player tracking state
+        showPlayerSelectionSheet = false
+        selectedPlayerPoint      = nil
+        trackedPlayerBox      = nil
+        trackedPlayerInitial  = nil
+        possessionDebug       = PossessionRuleEngine.DebugState()
+        detectionMode         = .shotDetection
         player?.pause()
         player = nil
 
@@ -763,7 +798,7 @@ struct ContentView: View {
             }
         } catch {
             isLoadingVideo = false
-            alertMessage   = "视频加载失败：\(error.localizedDescription)"
+            alertMessage   = String(format: t("video_load_failed"), error.localizedDescription)
             showAlert      = true
         }
     }
@@ -832,7 +867,7 @@ struct ContentView: View {
 
     private func startExport() {
         guard let url = videoURL, !clipRanges.isEmpty else {
-            alertMessage = "请先选择视频并确保有可用片段"
+            alertMessage = t("export_no_clips")
             showAlert    = true
             return
         }
@@ -899,9 +934,9 @@ struct ContentView: View {
                 detectionStats = "\(frameCount) 帧  |  🏀 ball×\(totalBall)  🏟 hoop×\(totalHoop)"
 
             } catch is CancellationError {
-                detectionStats = "检测已取消"
+                detectionStats = t("detection_cancelled")
             } catch {
-                alertMessage = "检测失败：\(error.localizedDescription)"
+                alertMessage = String(format: t("detection_failed"), error.localizedDescription)
                 showAlert    = true
             }
 
@@ -937,8 +972,7 @@ struct ContentView: View {
                     videoURL:           url,
                     fps:                12,
                     startSeconds:       startSec,
-                    maxDurationSeconds: 10,
-                    roiRectNormalized:  lockedRoiRect
+                    maxDurationSeconds: 10
                 ) { frac, debug, uiImage, dets in
                     detectionProgress  = frac
                     ruleEngineDebug    = debug
@@ -957,9 +991,9 @@ struct ContentView: View {
                 detectionStats = "10s 快检（\(String(format: "%.1f", startSec))s 起）：\(detectedEvents.count) makes | \(armed) | \(reason)"
 
             } catch is CancellationError {
-                detectionStats = "检测已取消"
+                detectionStats = t("detection_cancelled")
             } catch {
-                alertMessage = "检测失败：\(error.localizedDescription)"
+                alertMessage = String(format: t("detection_failed"), error.localizedDescription)
                 showAlert    = true
             }
 
@@ -998,8 +1032,7 @@ struct ContentView: View {
                 let detectedEvents = try await detector.detectMakes(
                     videoURL:           url,
                     fps:                12,
-                    maxDurationSeconds: nil,
-                    roiRectNormalized:  lockedRoiRect   // nil → full-frame fallback
+                    maxDurationSeconds: nil
                 ) { frac, debug, uiImage, dets in
                     detectionProgress  = frac
                     ruleEngineDebug    = debug
@@ -1014,68 +1047,25 @@ struct ContentView: View {
 
                 // ── Detection complete: update events & ranges ──────────
                 detectionProgress = 1.0
-                detectionStats = "完成：检测到 \(detectedEvents.count) 个进球"
+                detectionStats = String(format: t("detection_complete"), detectedEvents.count)
 
                 if !detectedEvents.isEmpty {
                     events = detectedEvents
                     await recomputeClips()
                 } else {
-                    detectionStats = "完成：未检测到进球（尝试调整参数或视频）"
+                    detectionStats = t("detection_no_makes")
                 }
 
             } catch is CancellationError {
-                detectionStats = "检测已取消"
+                detectionStats = t("detection_cancelled")
             } catch {
-                alertMessage = "检测失败：\(error.localizedDescription)"
+                alertMessage = String(format: t("detection_failed"), error.localizedDescription)
                 showAlert    = true
             }
 
             isRunningDetection = false
             isFullDetection    = false
         }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // MARK: - Hoop ROI (Step 6)
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Samples ~1 s of video inside `userROI`, picks the best hoop detection,
-    /// then sets `lockedRoiRect` = expand(hoopBbox, 2.2×).
-    private func lockHoopROI(userROI: CGRect) async {
-        guard let url = videoURL else { return }
-        isLockingROI = true
-        defer { isLockingROI = false }
-        do {
-            let engine  = try VisionInferenceEngine()
-            let sampler = VideoFrameSampler()
-            var allDets: [Detection] = []
-
-            // 6 fps × 1 s = up to 6 frames; enough to find a stable hoop
-            for try await frame in sampler.frames(from: url, fps: 6, maxSeconds: 1.0) {
-                let pb = frame.pixelBuffer
-                let dets = try await Task.detached {
-                    try engine.detect(
-                        pixelBuffer:       pb,
-                        timeSeconds:       frame.timeSeconds,
-                        roiRectNormalized: userROI
-                    )
-                }.value
-                allDets.append(contentsOf: dets)
-                try Task.checkCancellation()
-            }
-
-            lockedRoiRect = RoiMapper.deriveROI(from: allDets, userROI: userROI)
-        } catch {
-            // Fallback: no hoop found → just expand the drawn rect
-            lockedRoiRect = RoiMapper.expandAndClamp(userROI, by: 2.2)
-        }
-        isSelectingHoop = false
-    }
-
-    private func resetHoopROI() {
-        userSelectionRect = nil
-        lockedRoiRect     = nil
-        isSelectingHoop   = false
     }
 
     // ── Shared stop ─────────────────────────────────────────────────────────
@@ -1085,6 +1075,100 @@ struct ContentView: View {
         detectionTask      = nil
         isRunningDetection = false
         isFullDetection    = false
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // MARK: - Player Tracking (select player → track → possession events)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private func enterPlayerSelectionMode() {
+        player?.pause()
+        trackedPlayerInitial = nil
+        trackedPlayerBox     = nil
+        showPlayerSelectionSheet = true
+    }
+
+    private func runPlayerTracking() {
+        guard let url = videoURL, trackedPlayerInitial != nil else { return }
+
+        player?.pause()
+        isRunningDetection = true
+        isFullDetection    = true
+        detectionProgress  = 0
+        detectionTimeLabel = ""
+        currentDetections  = []
+        detectionStats     = ""
+        possessionDebug    = PossessionRuleEngine.DebugState()
+        ruleEngineDebug    = ShotRuleEngine.DebugState()
+
+        detectionTask = Task {
+            do {
+                let asset = AVURLAsset(url: url)
+                let dur   = try await asset.load(.duration)
+                let totalSec = CMTimeGetSeconds(dur)
+                detectionMaxSeconds = totalSec
+
+                let detector = PlayerDetector()
+
+                // Re-initialize the tracker on the detector's PlayerTracker
+                // using the same point and time
+                let currentSec = player?.currentTime().seconds ?? 0
+                if let point = selectedPlayerPoint {
+                    let _ = try await detector.initializePlayer(
+                        videoURL: url,
+                        tapPoint: point,
+                        atSeconds: currentSec
+                    )
+                }
+
+                let detectedEvents = try await detector.detectPossession(
+                    videoURL:           url,
+                    fps:                12,
+                    maxDurationSeconds: nil,
+                    detectShots:        true
+                ) { frac, posDebug, shotDebug, uiImage, dets, tracked in
+                    detectionProgress  = frac
+                    possessionDebug    = posDebug
+                    ruleEngineDebug    = shotDebug
+                    currentDetections  = dets
+                    trackedPlayerBox   = tracked?.boundingBox
+                    if let img = uiImage {
+                        currentFrameImage  = img
+                        detectionTimeLabel = String(format: "%.2f s", frac * detectionMaxSeconds)
+                    }
+                }
+
+                detectionProgress = 1.0
+
+                let gains  = detectedEvents.filter { $0.type == "gain" }.count
+                let losses = detectedEvents.filter { $0.type == "loss" }.count
+                let makes  = detectedEvents.filter { $0.type == "make" }.count
+
+                if !detectedEvents.isEmpty {
+                    events = detectedEvents
+                    await recomputeClips()
+                    var parts: [String] = []
+                    if gains + losses > 0 {
+                        parts.append(String(format: t("tracking_complete"), gains, losses))
+                    }
+                    if makes > 0 {
+                        parts.append(String(format: t("detection_complete"), makes))
+                    }
+                    detectionStats = parts.joined(separator: " | ")
+                } else {
+                    detectionStats = t("tracking_no_events")
+                }
+
+            } catch is CancellationError {
+                detectionStats = t("detection_cancelled")
+            } catch {
+                alertMessage = String(format: t("detection_failed"), error.localizedDescription)
+                showAlert    = true
+            }
+
+            isRunningDetection = false
+            isFullDetection    = false
+        }
     }
 }
 
@@ -1149,4 +1233,5 @@ private struct RangeRow: View {
 
 #Preview {
     ContentView()
+        .environmentObject(LanguageManager())
 }
